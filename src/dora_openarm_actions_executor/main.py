@@ -162,6 +162,7 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
         n_positions = len(event["value"])
         pos_shape = len(event["value"][0])
         reset = event["metadata"].get("reset", False)
+        print(f"Received event with {n_positions} positions, interval: {interval} ns, reset: {reset}")
         positions = event["value"].values.to_numpy().reshape(n_positions, pos_shape)
 
         # Initialize upsampler and low-pass filter if needed
@@ -184,6 +185,7 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
         # On a reset, these actions are the first of a new episode, so drop any
         # trajectory carried over from the previous one instead of blending it.
         if reset:
+            print("Resetting trajectory, discarding any previous trajectory.")
             canceled_positions = None
 
         # blend trajectory

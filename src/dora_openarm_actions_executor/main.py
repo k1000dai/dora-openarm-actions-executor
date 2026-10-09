@@ -135,20 +135,18 @@ class BiquadLowpass:
 
 
 async def _main_executor(node, events, arms, use_upsample, use_filter, control_hz):
-    def blend(canceled_positions, next_positions):
-        n = len(canceled_positions)
-        overlapped_positions = next_positions[:n]
-        weights = np.linspace(1, 0, n, dtype=np.float32).reshape(n, 1)
-        blended = canceled_positions * weights + overlapped_positions * (1 - weights)
-        return blended, n
+    """Execute each chunk to its end, then wait for actions observed after the stop.
 
+    Sync execution: the arm holds its last target while the policy infers, so the
+    first action of the next chunk matches the pose it was observed in. Actions
+    that arrive while a chunk is running were inferred from observations taken
+    while the arm was moving and are dropped.
+    """
     if not use_upsample and use_filter:
         print(
             "Warning: upsample is False, but filter is True. Forcing filter to False."
         )
         use_filter = False
-
-    canceled_positions = None
 
     upsampler = None
     lowpass = None
@@ -157,14 +155,22 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
     target_interval_s = None
     t_eval = None
 
+    stop_ns = 0  # when the arm stopped after the last chunk
+    reset_pending = False  # a reset carried by a dropped chunk
     while True:
         event = await events.get()
+        reset_pending = reset_pending or event["metadata"].get("reset", False)
+        # Actions observed before the stop were inferred while the arm was moving;
+        # without the observation time, arriving after the stop is enough.
+        observed_ns = event["metadata"].get("observation_timestamp")
+        if observed_ns is not None and observed_ns < stop_ns:
+            continue
         interval = event["metadata"]["interval"]
         # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
         cutoff = event["metadata"].get("cutoff_hz", 15)
         n_positions = len(event["value"])
         pos_shape = len(event["value"][0])
-        reset = event["metadata"].get("reset", False)
+        reset, reset_pending = reset_pending, False
         positions = event["value"].values.to_numpy().reshape(n_positions, pos_shape)
 
         # Initialize upsampler and low-pass filter if needed
@@ -184,38 +190,28 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
             if use_filter:
                 lowpass = BiquadLowpass(fs=control_hz, fc=cutoff)
 
-        # On a reset, these actions are the first of a new episode, so drop any
-        # trajectory carried over from the previous one instead of blending it.
+        # On a reset, these actions are the first of a new episode.
         if reset:
-            print("Resetting trajectory, discarding any previous trajectory.")
-            canceled_positions = None
-            # Also re-initialize the low-pass filter to the new episode's first
+            print("Resetting trajectory for a new episode.")
+            # Re-initialize the low-pass filter to the new episode's first
             # pose. Otherwise its retained state pulls the first samples toward
             # the previous episode's final pose, causing a jerk/ramp at start.
             # positions[0] equals the first upsampled sample (Hermite at t=0).
             if lowpass is not None:
                 lowpass.reset_state(positions[0])
 
-        # blend trajectory
-        if canceled_positions is not None:
-            blended, n = blend(canceled_positions, positions)
-            positions = np.concatenate([blended, positions[n:]])
-            canceled_positions = None
-
         # Conditionally upsample
         if use_upsample:
             loop_positions = upsampler.upsample(positions, t_eval)
             step_interval_ns = target_interval_ns
-            step_interval_s = target_interval_s
         else:
             loop_positions = positions
             step_interval_ns = interval
-            step_interval_s = interval / 1e9
 
         # send motor command
         base_time = time.time_ns() - step_interval_ns
 
-        for i_step, position in enumerate(loop_positions):
+        for position in loop_positions:
             # Conditionally apply low-pass filter
             if use_filter and lowpass is not None:
                 position = lowpass.step(position)
@@ -227,17 +223,6 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
 
             base_time = next_base_time
             timestamp = time.time_ns()
-
-            # If there is a new event, cancel the current event.
-            if not events.empty():
-                if use_upsample:
-                    consumed_time_s = i_step * step_interval_s
-                    consumed_raw_steps = int(consumed_time_s * dynamic_chunk_hz)
-                else:
-                    # If not upsampling, i_step corresponds directly to the original steps
-                    consumed_raw_steps = i_step
-                canceled_positions = positions[consumed_raw_steps:]
-                break
 
             offset = 0
             n_elements = 8  # 7 joints + 1 gripper
@@ -264,11 +249,19 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
                     {"timestamp": timestamp},
                 )
 
+        # The chunk is done and the arm holds its last target: drop the actions
+        # that arrived while it was running and wait for the next ones.
+        stop_ns = time.time_ns()
+        while not events.empty():
+            dropped = events.get_nowait()
+            reset_pending = reset_pending or dropped["metadata"].get("reset", False)
+
 
 async def _main_dora(node, events, executor_task):
     while True:
         if node.is_empty():
-            await asyncio.sleep(0.1)
+            # Poll often: the arm stands still until the next actions are read.
+            await asyncio.sleep(0.001)
             continue
         event = node.next()
         if event["type"] != "INPUT":
